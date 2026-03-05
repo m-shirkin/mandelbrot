@@ -5,5 +5,3 @@ Zoom in/out with scrolling wheel. Touchscreen devices are not supported. Require
 To run this:
 - clone this repository
 - run any http web server, like Apache, nginx or `npx lite-server` if node.js is installed
-
-Alternatively, you can go to https://vajaba.github.io/mandel/
