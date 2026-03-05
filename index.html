@@ -41,19 +41,21 @@ function fillPixel(pixelData32, ind, val) {
 
 var cscaleStep = 2;
 
-function distToPix(dist) {
-    return Number(dist / ((cscaleStep & 1) ? 1448n : 2048n));
+function distToPix(dist, cscale) {
+    return Number(dist / ((cscale & 1) ? 1448n : 2048n));
 }
 
-function pixToDist(pix) {
-    return BigInt(pix) * ((cscaleStep & 1) ? 1448n : 2048n);
+function pixToDist(pix, cscale) {
+    return BigInt(pix) * ((cscale & 1) ? 1448n : 2048n);
 }
 
 var xmin = 0n;
 var ymin = 0n;
         
-var valCache = {};
-const CACHE_POW = 7;
+var valCache = {
+	'history': []
+};
+const CACHE_POW = 8;
 const CACHE_SIZE = 1 << CACHE_POW;
 const CACHE_MASK = CACHE_SIZE - 1;
 
@@ -77,12 +79,24 @@ valCache.createCache = function() {
 }
 valCache.createCache();
 
-var redrawQueue = [];
-var redrawId = 0;
+valCache.cleanup = function() {
+	const MAX_LEN = 268435456 / CACHE_SIZE / CACHE_SIZE;
+	if (valCache.history.length > MAX_LEN) {
+		const newHistory = [];
+		let deli = 0;
+		for (const [s, i] of valCache.history) {
+			if (!valCache[s].data.get(i).tile && valCache.history.length - deli > MAX_LEN / 2) {
+				valCache[s].data.delete(i);
+				++deli;
+			} else {
+				newHistory.push([s,i]);
+			}
+		}
+		valCache.history = newHistory;
+	}
+}
 
-var procQueue = [];
-
-const NWORKERS = 8;
+const NWORKERS = Math.min(4, navigator.hardwareConcurrency - 1);
 var workerArr = [];
 
 var workQueue = [];
@@ -99,20 +113,28 @@ function U16FromU32(buf) {
     return data16;
 }
 
+function dispatchWorker(w) {
+    while (workQueue.length) {
+		const task = workQueue.pop();
+		let curc = valCache[task.cscaleStep];
+		let pend = curc.data.get(task.icxi + (task.icyi << 16));
+		if (pend && pend.status == 'queued' && (curc.xmin == task.cxmin) && (curc.ymin == task.cymin)) {
+			pend.status = 'pending';
+			w.postMessage(task);
+			return;
+		}
+	}
+}
+
 for (let i = 0; i < NWORKERS; ++i) {
     let w = new Worker('worker.js');
     w.addEventListener("message", function (msg) {
-//        valCache[msg.data.cscaleStep].data.set(msg.data.icxi + (msg.data.icyi << 16), new Uint32Array(msg.data.data));
-        valCache[msg.data.cscaleStep].data.set(msg.data.icxi + (msg.data.icyi << 16), U16FromU32(msg.data.data));
-        while (workQueue.length) {
-            let data = workQueue.pop();
-            let curc = valCache[data.cscaleStep];
-            if ((curc.data.get(data.icxi + (data.icyi << 16)) === null) && (curc.xmin == data.cxmin) && (curc.ymin == data.cymin)) {
-                w.postMessage(data);
-                return;
-            }
-        } 
-        workerFree[i] = 1;
+		let [s, i] = [msg.data.cscaleStep, msg.data.icxi + (msg.data.icyi << 16)];
+		let res = valCache[s].data.get(i);
+		valCache.history.push([s, i]);
+        res.data = U16FromU32(msg.data.data);
+		res.status = 'finished';
+		dispatchWorker(w);
     });
     workerArr.push(w);
 };
@@ -120,321 +142,486 @@ for (let i = 0; i < NWORKERS; ++i) {
 var sxmin;
 var symin;
 
-var redrawSet;
-var redrawArr;
+function forTilesInRange(rect, xmin, ymin, scale, fn) {
+	const cache = valCache[scale];
+	if (!cache) return;
+    const icx = distToPix(xmin - cache.xmin, scale);
+    const icy = distToPix(ymin - cache.ymin, scale);
+	
+	const ixmin = (icx + rect[0][0] - CACHE_MASK) >> CACHE_POW;
+	const ixmax = (icx + rect[0][1]) >> CACHE_POW;
+	const iymin = (icy + rect[1][0] - CACHE_MASK) >> CACHE_POW;
+	const iymax = (icy + rect[1][1]) >> CACHE_POW;
+	
+	for (let x = ixmin; x <= ixmax; ++x) {
+		for (let y = iymin; y <= iymax; ++y) {
+			fn(x, y);
+		}
+	}
+}
 
-function prepareRedraw(canvas, cx, cy) {
-    ++redrawId;
-    let curc = valCache[cscaleStep];
-    let icx = distToPix(xmin - curc.xmin);
-    let icy = distToPix(ymin - curc.ymin);
-    
+function DPR() {
+	return (window.devicePixelRatio || 1) * window.visualViewport.scale;
+}
+
+function wHeight() {
+	return window.visualViewport.height;
+}
+
+function wWidth() {
+	return window.visualViewport.width;
+}
+
+function scaledWindow() {
+	return [wWidth()*DPR(), wHeight()*DPR()];
+}
+
+function __dispatchForDraw(mx, my) {
+	valCache.createCache();
+    const curc = valCache[cscaleStep];
+	
     function overfl(d) {
         return d >> 2;
     }
     
-    let ximin = (icx - overfl(canvas.width)) >> CACHE_POW;
-    let ximax = (icx + canvas.width + overfl(canvas.width)) >> CACHE_POW;
-    let yimin = (icy - overfl(canvas.height)) >> CACHE_POW;
-    let yimax = (icy + canvas.height + overfl(canvas.height)) >> CACHE_POW;
+    let redrawArr = [];
+	
+	const [width, height] = scaledWindow();
 
-    let ximinr = icx >> CACHE_POW;
-    let ximaxr = (icx + canvas.width - 1) >> CACHE_POW;
-    let yiminr = icy >> CACHE_POW;
-    let yimaxr = (icy + canvas.height - 1) >> CACHE_POW;
+    forTilesInRange([[-overfl(width), width + overfl(width)],[-overfl(height), height + overfl(height)]], xmin, ymin, cscaleStep, (icxi, icyi)=>{
+		const bi = icxi + (icyi << 16);
+		if (!curc.data.get(bi)) {
+			curc.data.set(bi, {'status': 'queued'});
+		} else if (curc.data.get(bi).status != 'queued') {
+			return;
+		}
+		redrawArr.push([icxi, icyi]);
+	});
 
-    redrawArr = [];
-    redrawSet = new Set();
-
-    {
-        let i = 0;
-        for (let icxi = ximin; icxi <= ximax; ++icxi) {
-            for (let icyi = yimin; icyi <= yimax; ++icyi) {
-                redrawArr.push([icxi, icyi]);
-            }
-        }
-    }
-    
-    let cxi = (icx + cx) >> CACHE_POW;
-    let cyi = (icy + cy) >> CACHE_POW;
+	const cx = Math.floor(mx);
+	const cy = Math.floor(my);
+    const icx = distToPix(xmin - curc.xmin, cscaleStep);
+    const icy = distToPix(ymin - curc.ymin, cscaleStep);
+    const cxi = (icx + cx) >> CACHE_POW;
+    const cyi = (icy + cy) >> CACHE_POW;
     
     redrawArr.sort((p1, p2)=>{
-        let x1 = p1[0];
-        let x2 = p2[0];
-        let y1 = p1[1];
-        let y2 = p2[1];
+        const [x1, y1] = p1;
+        const [x2, y2] = p2;
         
-        let d1 = (x1 - cxi)*(x1 - cxi) + (y1 - cyi)*(y1 - cyi);
-        let d2 = (x2 - cxi)*(x2 - cxi) + (y2 - cyi)*(y2 - cyi);
+        const d1 = (x1 - cxi)*(x1 - cxi) + (y1 - cyi)*(y1 - cyi);
+        const d2 = (x2 - cxi)*(x2 - cxi) + (y2 - cyi)*(y2 - cyi);
         
         return d1 > d2 ? -1 : d1 == d2 ? 0 : 1;
     });
     
-    for (let i = 0; i < redrawArr.length; ++i) {
-        let p = redrawArr[i];
-        let icxi = p[0];
-        let icyi = p[1];
-        if ((icxi >= ximinr) && (icxi <= ximaxr) && (icyi >= yiminr) && (icyi <= yimaxr)) {
-            redrawSet.add(i);
-        }
-        let bi = icxi + (icyi << 16);
-        let ix = (icxi << CACHE_POW) + (icx & CACHE_MASK) - icx;
-        let iy = (icyi << CACHE_POW) + (icy & CACHE_MASK) - icy;
-        if (!curc.data.get(bi)) {
-            curc.data.set(bi, null);
-            workQueue.push({
-                'icxi': icxi,
-                'icyi': icyi,
-                'cxmin': curc.xmin,
-                'cymin': curc.ymin,
-                'cscaleStep': cscaleStep,
-                'maxIter': MAX_ITER * (((cscaleStep / 8) + 1.5) | 0)
-            });
-        }
+    for (const [icxi, icyi] of redrawArr) {
+		workQueue.push({
+			'icxi': icxi,
+			'icyi': icyi,
+			'cxmin': curc.xmin,
+			'cymin': curc.ymin,
+			'cscaleStep': cscaleStep,
+			'maxIter': MAX_ITER * (((cscaleStep / 8) + 1.5) | 0),
+			'cache_pow': CACHE_POW
+		});
     }
 
     for (let i = 0; i < NWORKERS; ++i) {
-        if (workQueue.length && workerFree[i]) {
-            workerFree[i] = 0;
-            workerArr[i].postMessage(workQueue.pop());
+        if (workerFree[i]) {
+			dispatchWorker(workerArr[i]);
         }
     }
     
     workQueue = workQueue.slice(-2048);
-    
-    return redrawId;
 }
 
-async function initRedraw(canvas, cx, cy, preppedId, redraw) {
-    if (preppedId != redrawId) return;
-    
-    let curc = valCache[cscaleStep];
-    let icx = distToPix(xmin - curc.xmin);
-    let icy = distToPix(ymin - curc.ymin);
+async function dispatchForDraw(mx, my) {
+	if (dispatchForDraw.free) {
+		dispatchForDraw.free = false;
+		while(true) {
+			__dispatchForDraw(mx, my)
+			await new Promise((a)=>{setTimeout(_=>a(), 250)});
+			if (dispatchForDraw.args) {
+				[mx, my] = dispatchForDraw.args;
+				dispatchForDraw.args = null;
+			} else {
+				dispatchForDraw.free = true;
+				return;
+			}
+		}
+	} else {
+		dispatchForDraw.args = [mx, my];
+	}
+}
+dispatchForDraw.free = true;
 
-    const ctx = canvas.getContext('2d');
-    let imageData = null;
-    let pixelData32;
-    
-    function getImageData() {
-        if (redraw) {
-            imageData = ctx.createImageData(canvas.width + 2 * CACHE_SIZE, canvas.height + 2 * CACHE_SIZE);
-            pixelData32 = new Uint32Array(imageData.data.buffer);
-            for (let ind = 0; ind < (imageData.data.length >> 2); ++ind) {
-                fillPixel(pixelData32, ind, 1);
-            }
-        } else {
-            imageData = ctx.getImageData(-(icx & CACHE_MASK), -(icy & CACHE_MASK), canvas.width + 2 * CACHE_SIZE, canvas.height + 2 * CACHE_SIZE);
-            pixelData32 = new Uint32Array(imageData.data.buffer);
-        }
-    }
-    
-    
-    while (redrawSet.size) {
-        for (let ind of redrawSet) {
-            let p = redrawArr[ind];
-            let icxi = p[0];
-            let icyi = p[1];
-            let ix = (icxi << CACHE_POW) + (icx & CACHE_MASK) - icx;
-            let iy = (icyi << CACHE_POW) + (icy & CACHE_MASK) - icy;
-            let data = curc.data.get(icxi + (icyi << 16));
-            if (data) {
-                if (imageData === null) getImageData();
-                redrawSet.delete(ind);
-                let datai = 0;
-                for (let dy = 0; dy < CACHE_SIZE; ++dy) {
-                    let ind = imageData.width * (dy + iy) + ix;
-                    for (let dx = 0; dx < CACHE_SIZE; ++dx) {
-                        fillPixel(pixelData32, ind, data[datai++]);
-                        ++ind;
-                    }
-                }
-            }
-        }
-        if (imageData) {
-            ctx.putImageData(imageData, -(icx & CACHE_MASK), -(icy & CACHE_MASK));
-        }
-        await new Promise((a)=>{requestAnimationFrame((t)=>a())});
-        if (preppedId != redrawId) return;
-    }
+var drawnTiles = [];
+
+function dscaleToStretch(dscale) {
+	dm = dscale % 2 == 0 ? 0 : 1;
+	let sfact = Math.pow(2, (dm - dscale) / 2);
+	if (dm > 0) {
+		if (cscaleStep & 1) {
+			sfact *= 181 / 256;
+		} else {
+			sfact *= 128 / 181;
+		}
+	}
+	return sfact;
 }
 
-var animProgress = 0;
-const animDuration = 50;
-
-async function animZoomIn(canvas, cx, cy, scaledImageData) {
-    animProgress = 1;
-    let ofscr = new OffscreenCanvas(scaledImageData.width, scaledImageData.height);
-    let ofctx = ofscr.getContext('2d', { 'willReadFrequently': true });
-    ofctx.putImageData(scaledImageData, 0, 0);
-
-    let ctx = canvas.getContext('2d');
-
-    let start = 0;
-    requestAnimationFrame((t)=>{start = t});
-    
-    await new Promise((finish) => {
-        let scalePic = function(time) {
-            let ptime = time - start;
-            if (ptime > animDuration) {
-                let scalefact = 256 / 181;
-                ctx.drawImage(ofscr, cx * (1 - scalefact), cy * (1 - scalefact), scaledImageData.width * scalefact, scaledImageData.height * scalefact);
-                finish();
-                animProgress = 0;
-                return;
-            }
-            let scalefact = 2 ** (ptime / animDuration / 2);
-            ctx.drawImage(ofscr, cx * (1 - scalefact), cy * (1 - scalefact), scaledImageData.width * scalefact, scaledImageData.height * scalefact);
-            
-            requestAnimationFrame(scalePic);
-        }
-        requestAnimationFrame(scalePic);
-    });
+function defaultTransform() {
+	return new DOMMatrix().
+		scale(1 / DPR());
 }
 
-async function animZoomOut(canvas, cx, cy) {
-    animProgress = 1;
-    await new Promise((a)=>{requestAnimationFrame((t)=>a())});
-    let ofscr = new OffscreenCanvas(canvas.width, canvas.height);
-    let ofctx = ofscr.getContext('2d', { 'willReadFrequently': true });
-    ofctx.fillStyle = fillCol;
-    ofctx.fillRect(0, 0, ofscr.width, ofscr.height);
-    
-    let scalefact = 181 / 256;
-    ofctx.drawImage(canvas, cx * (1 - scalefact), cy * (1 - scalefact), canvas.width * scalefact, canvas.height * scalefact);
-    
-    let ctx = canvas.getContext('2d');
-    ctx.drawImage(ofscr, 0, 0, canvas.width, canvas.height);
-    animProgress = 0;    
+var animation = {
+	'raw_transform': new DOMMatrix(),
+	'SPEED': 1,
+	'lastT': null
+};
+
+animation.transform = function() {
+	return defaultTransform().multiply(animation.raw_transform)
+}
+
+function transformRect(rect, transform) {
+	res = [[null, null],[null, null]];
+	for (let i of [0, 1]) {
+		const pt = (new DOMPoint(rect[0][i], rect[1][i])).matrixTransform(transform);
+		res[0][i] = pt.x;
+		res[1][i] = pt.y;
+	}
+	return res;
+}
+
+function toScaleFixed(matrix) {
+	function fixedPoint(matrix) {
+		const { a, b, c, d, e, f } = matrix;
+		const det = (a - 1) * (d - 1) - b * c;
+		if (det == 0) return [0, 0];
+		return [((c * f) - ((d - 1) * e)) / det, (((b * e) - ((a - 1) * f))) / det];
+	}
+
+	return [matrix.a, fixedPoint(matrix)];
+}
+
+function fromScaleFixed(scale, pt) {
+	return new DOMMatrix()
+		.translate(pt[0], pt[1])
+		.scale(scale)
+		.translate(-pt[0], -pt[1]);
+}
+
+function movePoint(x, y, dscale) {
+	let res = [x, y];
+	if (dscale < 0) {
+		for (let i of [0,1]) {
+			res[i] >>= BigInt((-dscale + 1 - (cscaleStep & 1)) >> 1);
+		}
+	} else {
+		for (let i of [0,1]) {
+			res[i] <<= BigInt((dscale + (cscaleStep & 1)) >> 1);
+		}
+	}
+	return res;
+}
+
+function drawForScale(dscale, z) {
+	const newScale = cscaleStep + dscale;
+	if (newScale < 0) return;
+	const curc = valCache[newScale];
+	if (!curc) return;
+	let [sxmin, symin] = movePoint(xmin, ymin, dscale);
+    let icx = distToPix(sxmin - curc.xmin, newScale);
+    let icy = distToPix(symin - curc.ymin, newScale);
+	const transform = animation.transform().scale(dscaleToStretch(dscale));
+	forTilesInRange(transformRect([[0, wWidth()],[0, wHeight()]], transform.inverse()), sxmin, symin, newScale, (ix, iy)=>{
+		const bi = ix + (iy << 16);
+		let cached = curc.data.get(bi);
+		if (!cached) return;
+		if (cached.status != 'finished') return;
+		let tile = cached.tile;
+		let draw = false;
+		if (!tile) {
+			tile = document.createElement('canvas');
+			cached.tile = tile;
+			tile.style.position = 'absolute';
+			tile.style['image-rendering'] = "pixelated";
+			tile.width = CACHE_SIZE;
+			tile.height = CACHE_SIZE;
+			document.getElementById('main').appendChild(tile);
+			const ctx = tile.getContext('2d');
+			const imgData = ctx.createImageData(CACHE_SIZE, CACHE_SIZE);
+			const pixelData = new Uint32Array(imgData.data.buffer);
+			for (let i = 0; i < pixelData.length; ++i) {
+				fillPixel(pixelData, i, cached.data[i]);
+			}
+			ctx.putImageData(imgData, 0, 0);
+			drawnTiles.push([newScale, bi]);
+		}
+		tile.style['z-index'] = z;
+		let ixp = (ix << CACHE_POW) - icx;
+		let iyp = (iy << CACHE_POW) - icy;
+		
+		function computeRoundInterval(intvl) {
+			const precision = 0.01;
+			return [
+				Math.floor(intvl[0] / precision) * precision,
+				(Math.floor(intvl[1] / precision) + 1) * precision
+			];
+		}
+		const rawRect = [[ixp, ixp + CACHE_SIZE], [iyp, iyp + CACHE_SIZE]];
+		let rect = transformRect(rawRect, transform);
+		for (let i of [0,1]) {
+			rect[i] = computeRoundInterval([rect[i][0], rect[i][1]]);
+		}
+		tile.style.width = `${rect[0][1] - rect[0][0]}px`;
+		tile.style.height = `${rect[1][1] - rect[1][0]}px`;
+		tile.style.left = `${rect[0][0]}px`;
+		tile.style.top = `${rect[1][0]}px`;
+		//tile.style.visibility = dscale == 0 ? 'hidden' : 'visible';
+		tile.__drawn = true;
+	});
+}
+
+var easingEnabled = true;
+
+function animEasingStep() {
+	curAnimT = Date.now();
+	if (animation.lastT && curAnimT > animation.lastT && easingEnabled) {
+		let [scale, fixed] = toScaleFixed(animation.raw_transform);
+		let dlog = animation.SPEED * (curAnimT - animation.lastT) / 1000;
+		if (dlog > Math.abs(Math.log(scale))) {
+			scale = 1;
+		} else {
+			dlog += (Math.abs(Math.log(scale)) - dlog) * animation.SPEED / 10;
+			scale *= Math.exp(dlog * (scale > 1 ? -1 : 1));
+		}
+		animation.raw_transform = fromScaleFixed(scale, fixed);
+	}
+	animation.lastT = curAnimT;
+}
+
+async function drawLoop() {
+	while (true) {
+		await new Promise((a)=>{requestAnimationFrame((t)=>a())});
+		const drawnByScale = new Map();
+		for (let [s, i] of drawnTiles) {
+			valCache[s].data.get(i).tile.__drawn = false;
+			drawnByScale.set(s, drawnByScale.get(s) + 1 || 1);
+		}
+		
+		const layers = Array.from(drawnByScale.keys()).filter((s)=>{return s < cscaleStep}).sort((s1, s2)=>{
+			const c1 = drawnByScale.get(s1) - drawnByScale.get(s2);
+			return c1 != 0 ? c1 : s1 - s2;
+		}).slice(-3);
+		
+		for (let i = 0; i < layers.length; ++i) {
+			drawForScale(layers[i] - cscaleStep, i);
+		}
+		drawForScale(0, layers.length);
+
+		let redrawnTiles = [];
+		valCache.cleanup();
+		for (let [s, i] of drawnTiles) {
+			const cache = valCache[s].data.get(i);
+			if (cache) {
+				if (!cache.tile.__drawn) {
+					cache.tile = cache.tile.remove();
+				} else {
+					redrawnTiles.push([s, i]);
+				}
+			}
+		}
+		drawnTiles = redrawnTiles;
+		
+		animEasingStep();
+	}
+}
+
+function dprScale(evt) {
+	const pt = new DOMPoint(evt.clientX, evt.clientY)
+		.matrixTransform(animation.transform().inverse());
+	return [Math.round(pt.x), Math.round(pt.y)];
+}
+
+function dragBy(dx, dy) {
+	if (dx == 0 && dy == 0) return;
+	xmin -= pixToDist(dx, cscaleStep);
+	ymin -= pixToDist(dy, cscaleStep);
+}
+
+function visualScale(stretch, fx, fy) {
+	animation.raw_transform.multiplySelf(new DOMMatrix()
+		.translate(fx, fy)
+		.scale(stretch)
+		.translate(-fx, -fy)
+	);
+}
+
+function scaleBy(dscale, fx, fy) {
+	let [ax, ay] = movePoint(pixToDist(fx, cscaleStep) + xmin, pixToDist(fy, cscaleStep) + ymin, dscale);
+	let stretch = 1;
+	stretch = dscaleToStretch(dscale);
+	cscaleStep += dscale;
+	visualScale(stretch, fx, fy);
+    xmin = ax - pixToDist(fx, cscaleStep);
+    ymin = ay - pixToDist(fy, cscaleStep);
+}
+
+async function onMove(evt) {
+	if (evt === 'cancel') {
+		onMove.pstate = null;
+	} else {
+		const [ex, ey] = dprScale(evt);
+		if (onMove.pstate != null) {
+			let [px, py] = onMove.pstate;
+			dragBy(ex - px, ey - py);
+			dispatchForDraw(ex, ey);
+		}
+		onMove.pstate = [ex, ey];
+	}
+}
+
+async function onPinch(evts) {
+	function mid(p1, p2) {
+		let res = [];
+		for (let i of [0,1]) {
+			res.push((p1[i] + p2[i]) >> 1);
+		}
+		return res;
+	}
+	
+	if (evts == 'cancel') {
+		if (onPinch.initState != null) {
+			onPinch.initState = null;
+			let [scale, fixed] = toScaleFixed(animation.raw_transform)
+			let dscale = Math.round(Math.log(scale) / Math.log(1.4142));
+			if (dscale + cscaleStep < 0) dscale = -cscaleStep;
+			if (dscale != 0) {
+				const [x1, y1, x2, y2] = onPinch.pState;
+				const [mx, my] = mid([x1, y1], [x2, y2]); 
+				scaleBy(dscale, mx, my);
+			}
+			const [ex, ey] = dprScale({
+				'clientX': wWidth() >> 1,
+				'clientY': wHeight() >> 1,
+			})
+			dispatchForDraw(ex, ey);
+			easingEnabled = true;
+		}
+	} else {
+		easingEnabled = false;
+		const [x1, y1, x2, y2] = [...dprScale(evts[0]), ...dprScale(evts[1])];
+		if (onPinch.initState != null) {
+			const [ix1, iy1, ix2, iy2] = onPinch.initState;
+			const [px1, py1, px2, py2] = onPinch.pState;
+			function dist(p1, p2) {
+				return Math.hypot(p1[0] - p2[0], p1[1] - p2[1]);
+			}
+			
+			const [mx, my] = mid([x1, y1], [x2, y2]);
+			const d = dist([x1, y1], [x2, y2]);
+			const [pmx, pmy] = mid([px1, py1], [px2, py2]);
+			const id = dist([ix1, iy1], [ix2, iy2]);
+			dragBy(mx - pmx, my - pmy);
+			dispatchForDraw(mx, my);
+			visualScale(d / id, mx, my);
+		} else {
+			onPinch.initTransform = animation.transform();
+			onPinch.initState = [x1, y1, x2, y2];
+		}
+		onPinch.pState = [x1, y1, x2, y2];
+	}
 }
 
 async function onScroll(evt) {
-    if (animProgress) return;
-    if (evt.buttons & 1) {
-        return;
-    }
-    let ax = pixToDist(evt.offsetX) + xmin;
-    let ay = pixToDist(evt.offsetY) + ymin;
-    let zoomIn = false;
+	const [ex, ey] = dprScale(evt);
+	let dscale = 0;
     if (evt.wheelDelta < 0) {
         if (cscaleStep > 0) {
-            --cscaleStep;
-            if (cscaleStep & 1) {
-                ax >>= 1n;
-                ay >>= 1n;
-            }
-        } else {
-            return;
+			dscale = -1;
         }
     } else {
-        sxmin = xmin;
-        symin = ymin;
-        if (cscaleStep & 1) {
-            ax <<= 1n;
-            ay <<= 1n;
-            sxmin <<= 1n;
-            symin <<= 1n;
-        }
-        ++cscaleStep;
-        zoomIn = true;
+		dscale = 1;
     }
-    xmin = ax - pixToDist(evt.offsetX);
-    ymin = ay - pixToDist(evt.offsetY);
-    valCache.createCache();
-    let pId = prepareRedraw(evt.target, evt.offsetX, evt.offsetY);
-    if (zoomIn) {
-        ctx = evt.target.getContext('2d');
-        let scaledImageData = ctx.getImageData(0, 0, evt.target.width, evt.target.height);
-        await animZoomIn(evt.target, evt.offsetX, evt.offsetY, scaledImageData);
-    } else {
-        await animZoomOut(evt.target, evt.offsetX, evt.offsetY);
-    }
-    initRedraw(evt.target, evt.offsetX, evt.offsetY, pId, false);
-}
-
-async function animMove(canvas, dx, dy) {
-    animProgress = 1;
-    await new Promise((a)=>{requestAnimationFrame((t)=>a())});
-    let ctx = canvas.getContext('2d');
-    ctx.drawImage(canvas, dx, dy, canvas.width, canvas.height);
-    ctx.fillStyle = fillCol;
-    if (dx > 0) {
-        ctx.fillRect(0, 0, dx, canvas.height);
-    } else {
-        ctx.fillRect(canvas.width + dx, 0, -dx, canvas.height);
-    }
-    if (dy > 0) {
-        ctx.fillRect(0, 0, canvas.width, dy);
-    } else {
-        ctx.fillRect(0, canvas.height + dy, canvas.width, -dy);
-    }
-    animProgress = 0;
-}
-
-var px, py;
-var drag = false;
-
-async function onMove(evt) {
-    if (animProgress) return;
-    if (evt.buttons & 1) {
-        if (drag) {
-            xmin -= pixToDist(evt.offsetX - px);
-            ymin -= pixToDist(evt.offsetY - py);
-            let pId = prepareRedraw(evt.target, evt.offsetX, evt.offsetY);
-            await animMove(evt.target, evt.offsetX - px, evt.offsetY - py);
-            initRedraw(evt.target, evt.offsetX, evt.offsetY, pId, false);
-        }
-        px = evt.offsetX;
-        py = evt.offsetY;
-        drag = true;
-    } else {
-        drag = false;
-    }
+	scaleBy(dscale, ex, ey);
+	dispatchForDraw(ex, ey);
 }
 
 document.addEventListener("DOMContentLoaded", ()=>{
-    const canvas = document.getElementById('main');
-    
-    function centerXY() {
-        xmin = - pixToDist(canvas.width >> 1) - (1n << BigInt((cscaleStep >> 1) + 18));
-        ymin = - pixToDist(canvas.height >> 1);
-    }
-    
     function onResize() {
-        canvas.width = window.innerWidth;
-        canvas.height = window.innerHeight;
-        let pId = prepareRedraw(canvas, canvas.width / 2, canvas.height / 2);
-        initRedraw(canvas, canvas.width / 2, canvas.height / 2, pId, true);
+		animation.raw_transform = new DOMMatrix();
+		const [w, h] = scaledWindow();
+		dispatchForDraw(w, h, w>>1, h>>1);
     }
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
-//    canvas.getContext('2d');
-    canvas.getContext('2d', { 'willReadFrequently': true });
-    centerXY();
-    let pId = prepareRedraw(canvas, canvas.width / 2, canvas.height / 2);
-    initRedraw(canvas, canvas.width / 2, canvas.height / 2, pId, true);
+
+	const [w, h] = scaledWindow();
+	xmin = - pixToDist(w >> 1) - (1n << BigInt((cscaleStep >> 1) + 18));
+	ymin = - pixToDist(h >> 1);
+	onResize();
+	drawLoop();
     
-    canvas.addEventListener('wheel', onScroll);
-    canvas.addEventListener('mousemove', onMove);
+	const evtTarget = document.body;
+	evtTarget.id = 'control';
+	evtTarget.style['touch-action'] = 'none';
+	evtTarget.style.backgroundColor = fillCol;
+	
+    evtTarget.addEventListener('wheel', onScroll);
+//    evtTarget.addEventListener('mousemove', onMove);
+
+	const pointers = new Map();
+	evtTarget.addEventListener("pointerdown", e => {
+	  pointers.set(e.pointerId, e);
+	  evtTarget.setPointerCapture(e.pointerId);
+	});
+
+	evtTarget.addEventListener("pointermove", e => {
+	  if (!pointers.has(e.pointerId)) return;
+	  pointers.set(e.pointerId, e);
+
+	  if (pointers.size === 1) {
+		onMove(e);
+		//onPinch([{'clientX': 0, 'clientY': 0}, ...pointers.values()]);
+	  } else if (pointers.size === 2) {
+		onPinch([...pointers.values()]);
+	  }
+	});
+
+	evtTarget.addEventListener("pointerup", cleanup);
+	evtTarget.addEventListener("pointercancel", cleanup);
+
+	function cleanup(e) {
+	  onMove('cancel');
+	  onPinch('cancel');
+	  pointers.delete(e.pointerId);
+	}
         
-    window.addEventListener("resize", onResize);
-    
+    window.addEventListener("resize", onResize);	
 });
         </script>
         <style>
-            canvas#main {
-                cursor: grab;
-            }
-            
-            canvas#main:active {
-                cursor: grabbing;
-            }            
+			html, body {
+			  margin: 0;
+			  padding: 0;
+			  width: 100%;
+			  height: 100%;
+			  overflow: hidden;
+			}
+
+			#control {
+              cursor: grab;
+			}
+			
+			#control:active {
+              cursor: grabbing;
+			}
         </style>
     </head>
-    <body style="margin: 0px; overflow: hidden">
-        <div style="margin-top: 0px; padding: 0px; display: flex;">
-            <canvas id="main">
-            </canvas>
+    <body>
+        <div id="main" style="margin-top: 0px; padding: 0px; display: block;">
         </div>
     </body>
 </html>

@@ -1,6 +1,4 @@
-const CACHE_POW = 7;
-const CACHE_SIZE = 1 << CACHE_POW;
-const CACHE_MASK = CACHE_SIZE - 1;
+var CACHE_POW, CACHE_SIZE, CACHE_MASK;
 
 var cscaleStep;
 
@@ -359,7 +357,7 @@ function calcGL(ix, iy, cxmin, cymin, maxIter) {
 function calcData(icxi, icyi, cxmin, cymin, maxIter, data) {
     let ix = icxi << CACHE_POW;
     let iy = icyi << CACHE_POW;
-    if ((cscaleStep > 80) && gl) {
+    if ((cscaleStep > 30) && gl) {
         return calcGL(ix, iy, cxmin, cymin, maxIter);
     } else {
         return calcFloat(ix, iy, cxmin, cymin, maxIter);
@@ -368,6 +366,9 @@ function calcData(icxi, icyi, cxmin, cymin, maxIter, data) {
 
 self.onmessage = function (msg) {
     cscaleStep = msg.data.cscaleStep;
+	CACHE_POW = msg.data.cache_pow;
+	CACHE_SIZE = 1 << CACHE_POW;
+	CACHE_MASK = CACHE_SIZE - 1;
     msg.data['data'] = calcData(msg.data.icxi, msg.data.icyi, msg.data.cxmin, msg.data.cymin, msg.data.maxIter).buffer;
     self.postMessage(msg.data, [msg.data.data]);
 };
