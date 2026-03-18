@@ -85,7 +85,7 @@ valCache.cleanup = function() {
 		const newHistory = [];
 		let deli = 0;
 		for (const [s, i] of valCache.history) {
-			if (!valCache[s].data.get(i).tile && valCache.history.length - deli > MAX_LEN / 2) {
+			if (valCache[s].data.get(i) && !valCache[s].data.get(i).tile && valCache.history.length - deli > MAX_LEN / 2) {
 				valCache[s].data.delete(i);
 				++deli;
 			} else {
@@ -549,6 +549,88 @@ async function onScroll(evt) {
     }
 	scaleBy(dscale, ex, ey);
 	dispatchForDraw(ex, ey);
+}
+
+function snapshot(w, h) {
+    valCache.createCache();
+    const curc = valCache[cscaleStep];
+    const scale = cscaleStep;
+    const [viewW, viewH] = scaledWindow();
+    const icx = distToPix(xmin - curc.xmin, scale);
+    const icy = distToPix(ymin - curc.ymin, scale);
+    const maxIter = MAX_ITER * (((scale / 8) + 1.5) | 0);
+
+    // 1:1 pixel mapping, centered on viewport center
+    const x0 = icx + (viewW >> 1) - (w >> 1);
+    const y0 = icy + (viewH >> 1) - (h >> 1);
+
+    const ixmin = x0 >> CACHE_POW;
+    const ixmax = (x0 + w - 1) >> CACHE_POW;
+    const iymin = y0 >> CACHE_POW;
+    const iymax = (y0 + h - 1) >> CACHE_POW;
+
+    const needed = [];
+    for (let ix = ixmin; ix <= ixmax; ix++) {
+        for (let iy = iymin; iy <= iymax; iy++) {
+            const bi = ix + (iy << 16);
+            if (!curc.data.get(bi)) {
+                curc.data.set(bi, {'status': 'queued'});
+                workQueue.push({
+                    'icxi': ix, 'icyi': iy,
+                    'cxmin': curc.xmin, 'cymin': curc.ymin,
+                    'cscaleStep': scale, 'maxIter': maxIter,
+                    'cache_pow': CACHE_POW
+                });
+            }
+            needed.push(bi);
+        }
+    }
+
+    for (let i = 0; i < NWORKERS; ++i) {
+        dispatchWorker(workerArr[i]);
+    }
+
+    return new Promise(resolve => {
+        (function check() {
+            if (!needed.every(bi => { const c = curc.data.get(bi); return c && c.status === 'finished'; })) {
+                setTimeout(check, 100);
+                return;
+            }
+
+            const canvas = document.createElement('canvas');
+            canvas.width = w;
+            canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            const imgData = ctx.createImageData(w, h);
+            const pd = new Uint32Array(imgData.data.buffer);
+
+            for (let py = 0; py < h; py++) {
+                const ty = y0 + py;
+                const iy = ty >> CACHE_POW;
+                const dy = ty - (iy << CACHE_POW);
+                for (let px = 0; px < w; px++) {
+                    const tx = x0 + px;
+                    const ix = tx >> CACHE_POW;
+                    const dx = tx - (ix << CACHE_POW);
+                    const cached = curc.data.get(ix + (iy << 16));
+                    if (cached && cached.data) {
+                        fillPixel(pd, py * w + px, cached.data[(dy << CACHE_POW) + dx]);
+                    }
+                }
+            }
+
+            ctx.putImageData(imgData, 0, 0);
+            canvas.toBlob(blob => {
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'mandelbrot.png';
+                a.click();
+                URL.revokeObjectURL(url);
+                resolve();
+            }, 'image/png');
+        })();
+    });
 }
 
 document.addEventListener("DOMContentLoaded", ()=>{
