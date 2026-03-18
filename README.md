@@ -1,6 +1,6 @@
 # Mandelbrot set explorer.
 
-Zoom in/out with scrolling wheel. Touchscreen devices are not supported. Requires WebGL 2 support.
+Zoom in/out with scrolling wheel on pinch gesture. Requires WebGL 2 support.
 
 To run this:
 - clone this repository
