@@ -404,9 +404,11 @@ function animEasingStep() {
 	animation.lastT = curAnimT;
 }
 
+var DRAWING_ENABLED = true
 async function drawLoop() {
 	while (true) {
 		await new Promise((a)=>{requestAnimationFrame((t)=>a())});
+		if (!DRAWING_ENABLED) continue
 		const drawnByScale = new Map();
 		for (let [s, i] of drawnTiles) {
 			valCache[s].data.get(i).tile.__drawn = false;
@@ -552,6 +554,10 @@ async function onScroll(evt) {
 }
 
 function snapshot(w, h) {
+	DRAWING_ENABLED = false
+    console.log(`[snapshot] Starting ${w}x${h} capture...`);
+    const t0 = performance.now();
+
     valCache.createCache();
     const curc = valCache[cscaleStep];
     const scale = cscaleStep;
@@ -570,6 +576,7 @@ function snapshot(w, h) {
     const iymax = (y0 + h - 1) >> CACHE_POW;
 
     const needed = [];
+    let queued = 0;
     for (let ix = ixmin; ix <= ixmax; ix++) {
         for (let iy = iymin; iy <= iymax; iy++) {
             const bi = ix + (iy << 16);
@@ -581,21 +588,31 @@ function snapshot(w, h) {
                     'cscaleStep': scale, 'maxIter': maxIter,
                     'cache_pow': CACHE_POW
                 });
+                queued++;
             }
             needed.push(bi);
         }
     }
+    console.log(`[snapshot] ${needed.length} tiles needed, ${queued} newly queued (${needed.length - queued} cached)`);
 
     for (let i = 0; i < NWORKERS; ++i) {
         dispatchWorker(workerArr[i]);
     }
 
     return new Promise(resolve => {
+        let lastLog = 0;
         (function check() {
-            if (!needed.every(bi => { const c = curc.data.get(bi); return c && c.status === 'finished'; })) {
+            const done = needed.filter(bi => { const c = curc.data.get(bi); return c && c.status === 'finished'; }).length;
+            if (done < needed.length) {
+                const now = performance.now();
+                if (now - lastLog > 500) {
+                    console.log(`[snapshot] Computing tiles: ${done}/${needed.length} (${(done / needed.length * 100).toFixed(1)}%)`);
+                    lastLog = now;
+                }
                 setTimeout(check, 100);
                 return;
             }
+            console.log(`[snapshot] All ${needed.length} tiles ready in ${((performance.now() - t0) / 1000).toFixed(2)}s. Assembling image...`);
 
             const canvas = document.createElement('canvas');
             canvas.width = w;
@@ -620,6 +637,7 @@ function snapshot(w, h) {
             }
 
             ctx.putImageData(imgData, 0, 0);
+            console.log(`[snapshot] Image assembled. Encoding PNG...`);
             canvas.toBlob(blob => {
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
@@ -627,6 +645,8 @@ function snapshot(w, h) {
                 a.download = 'mandelbrot.png';
                 a.click();
                 URL.revokeObjectURL(url);
+                console.log(`[snapshot] Done. ${w}x${h} PNG saved in ${((performance.now() - t0) / 1000).toFixed(2)}s`);
+				DRAWING_ENABLED = true
                 resolve();
             }, 'image/png');
         })();
